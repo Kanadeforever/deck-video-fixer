@@ -10,7 +10,7 @@
 
 ## 特点
 
-- 不需要除FFMPEG外的任何内容；
+- 不需要除[FFMPEG](https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz)外的任何内容；
 - Steam Deck 桌面模式下可直接运行脚本；
 - 使用 `ffprobe` 扫描视频信息，使用 `ffmpeg` 转码；
 - 默认只处理易出问题格式，不碰正常 MP4/WebM/OGV；
@@ -19,6 +19,12 @@
 - 支持从备份还原；
 - 支持多种转码策略，由用户在开始前选择；
 - 支持FFMPEG下载慢地区：可重试、断点续传、缓存、手动离线放包、自定义镜像 URL；
+
+---
+
+## 依赖
+
+- [FFMPEG](https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz)
 
 ---
 
