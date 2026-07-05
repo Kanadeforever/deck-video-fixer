@@ -1,5 +1,7 @@
 # Deck Video Fixer
 
+中文 | [English](README.en.md)
+
 一个给 Steam Deck / Linux 用户用的 Proton 视频解码器问题修复小工具。
 
 它的目标不是“压缩视频”或“优化画质”，而是尽量低侵入地修复一些游戏在 Proton/Wine 下播放过场动画时出现的彩条、黑屏、跳过视频、无声等问题。
