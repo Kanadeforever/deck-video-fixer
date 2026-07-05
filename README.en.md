@@ -225,7 +225,7 @@ The default mode first asks you to paste a path; if left blank, it opens the sys
    ```bash
    ./deck-video-fixer.sh
    ```
-   Right-click on this file and select `Run in Konsole` to execute it. You can also double-click it to run, but you may not see the transcode progress if there's no terminal window.
+   Right-click on this file, select `Properties`, then choose `Permissions`, and check `Allow executing file as program (E)`, then click "OK". After that, double-click the script to run it.
 2. Choose an action:
    ```text
    Scan & transcode to fix Proton compatibility issues
