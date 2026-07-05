@@ -5,10 +5,14 @@
 
 set -u
 
-TOOL_VERSION="0.3.2"
+TOOL_VERSION="0.3.5"
 BACKUP_DIR_NAME=".deck-video-fixer-backup"
 MANIFEST_NAME="manifest.tsv"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# When launched from Dolphin/Konsole, the current working directory may not be
+# the script directory. Keep relative helper lookups predictable.
+cd "$SCRIPT_DIR" 2>/dev/null || true
 
 # Prefer bundled ffmpeg/ffprobe if a future release ships them next to this script.
 if [[ -x "$SCRIPT_DIR/bin/ffmpeg" ]]; then
@@ -24,8 +28,14 @@ fi
 
 HAS_KDIALOG=0
 HAS_ZENITY=0
+QDBUS_CMD=""
 command -v kdialog >/dev/null 2>&1 && HAS_KDIALOG=1
 command -v zenity >/dev/null 2>&1 && HAS_ZENITY=1
+if command -v qdbus >/dev/null 2>&1; then
+  QDBUS_CMD="$(command -v qdbus)"
+elif command -v qdbus6 >/dev/null 2>&1; then
+  QDBUS_CMD="$(command -v qdbus6)"
+fi
 
 # Directory picker style. Steam Deck's native kdialog folder chooser can be awkward
 # because it may not expose an address/location bar. The default therefore asks
@@ -40,6 +50,9 @@ PVF_TRANSCODE_MODE="${PVF_TRANSCODE_MODE:-recommended}"
 # Backup handling after a successful conversion. Valid values: ask, keep, delete.
 # Default is ask; the delete path is only offered when all selected files converted successfully.
 PVF_BACKUP_AFTER_SUCCESS="${PVF_BACKUP_AFTER_SUCCESS:-ask}"
+# Progress display. Valid values: auto, zenity, kdialog, terminal, off.
+# auto prefers zenity, then kdialog+qdbus, then terminal output.
+PVF_PROGRESS="${PVF_PROGRESS:-auto}"
 
 ui_info() {
   local msg="$1"
@@ -91,6 +104,185 @@ ui_textbox() {
     cat "$file"
     printf '\n==== End ====\n'
   fi
+}
+
+
+# One progress UI is kept open for the whole conversion run. It shows the
+# current file percentage inside the label, while the progress bar itself is the
+# total batch percentage. This matters when the script is launched by double
+# clicking and there is no visible terminal window.
+PVF_PROGRESS_KIND=""
+PVF_PROGRESS_LAST=-1
+PVF_PROGRESS_KD_SERVICE=""
+PVF_PROGRESS_KD_PATH=""
+
+progress_begin() {
+  local total="$1"
+  local mode="$PVF_PROGRESS"
+  PVF_PROGRESS_KIND="terminal"
+
+  case "$mode" in
+    off|none|false|0)
+      PVF_PROGRESS_KIND="off"
+      return 0
+      ;;
+    zenity)
+      [[ $HAS_ZENITY -eq 1 ]] && PVF_PROGRESS_KIND="zenity" || PVF_PROGRESS_KIND="terminal"
+      ;;
+    kdialog)
+      [[ $HAS_KDIALOG -eq 1 && -n "$QDBUS_CMD" ]] && PVF_PROGRESS_KIND="kdialog" || PVF_PROGRESS_KIND="terminal"
+      ;;
+    terminal)
+      PVF_PROGRESS_KIND="terminal"
+      ;;
+    auto|*)
+      if [[ $HAS_ZENITY -eq 1 ]]; then
+        PVF_PROGRESS_KIND="zenity"
+      elif [[ $HAS_KDIALOG -eq 1 && -n "$QDBUS_CMD" ]]; then
+        PVF_PROGRESS_KIND="kdialog"
+      else
+        PVF_PROGRESS_KIND="terminal"
+      fi
+      ;;
+  esac
+
+  if [[ "$PVF_PROGRESS_KIND" == "zenity" ]]; then
+    coproc PVF_ZENITY_PROGRESS { zenity --progress --title="Deck Video Fixer" --text="准备转码..." --percentage=0 --width=650 --auto-close --no-cancel 2>/dev/null; }
+    sleep 0.1
+  elif [[ "$PVF_PROGRESS_KIND" == "kdialog" ]]; then
+    local ref
+    ref="$(kdialog --title "Deck Video Fixer" --progressbar "准备转码..." 100 2>/dev/null || true)"
+    if [[ "$ref" == *" "* ]]; then
+      PVF_PROGRESS_KD_SERVICE="${ref%% *}"
+      PVF_PROGRESS_KD_PATH="${ref#* }"
+    else
+      PVF_PROGRESS_KIND="terminal"
+    fi
+  elif [[ "$PVF_PROGRESS_KIND" == "terminal" ]]; then
+    printf '\nDeck Video Fixer：准备转码 %s 个文件...\n' "$total" >&2
+  fi
+}
+
+progress_update() {
+  local pct="$1"
+  local msg="$2"
+  [[ -z "$pct" ]] && pct=0
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+
+  # Avoid flooding GUI pipes/D-Bus with duplicate integer percentages.
+  if [[ "$pct" == "$PVF_PROGRESS_LAST" && "$PVF_PROGRESS_KIND" != "terminal" ]]; then
+    return 0
+  fi
+  PVF_PROGRESS_LAST="$pct"
+
+  case "$PVF_PROGRESS_KIND" in
+    zenity)
+      if [[ -n "${PVF_ZENITY_PROGRESS[1]:-}" ]]; then
+        {
+          printf '%s\n' "$pct"
+          printf '# %s\n' "$msg"
+        } >&"${PVF_ZENITY_PROGRESS[1]}" 2>/dev/null || true
+      fi
+      ;;
+    kdialog)
+      if [[ -n "$PVF_PROGRESS_KD_SERVICE" && -n "$PVF_PROGRESS_KD_PATH" ]]; then
+        "$QDBUS_CMD" "$PVF_PROGRESS_KD_SERVICE" "$PVF_PROGRESS_KD_PATH" Set "" value "$pct" >/dev/null 2>&1 || true
+        "$QDBUS_CMD" "$PVF_PROGRESS_KD_SERVICE" "$PVF_PROGRESS_KD_PATH" setLabelText "$msg" >/dev/null 2>&1 \
+          || "$QDBUS_CMD" "$PVF_PROGRESS_KD_SERVICE" "$PVF_PROGRESS_KD_PATH" org.kde.kdialog.ProgressDialog.setLabelText "$msg" >/dev/null 2>&1 \
+          || true
+      fi
+      ;;
+    terminal)
+      printf '\r[%3s%%] %s' "$pct" "$msg" >&2
+      ;;
+  esac
+}
+
+progress_finish() {
+  progress_update 100 "完成"
+  case "$PVF_PROGRESS_KIND" in
+    zenity)
+      if [[ -n "${PVF_ZENITY_PROGRESS[1]:-}" ]]; then
+        exec {PVF_ZENITY_PROGRESS[1]}>&- 2>/dev/null || true
+      fi
+      ;;
+    kdialog)
+      if [[ -n "$PVF_PROGRESS_KD_SERVICE" && -n "$PVF_PROGRESS_KD_PATH" ]]; then
+        "$QDBUS_CMD" "$PVF_PROGRESS_KD_SERVICE" "$PVF_PROGRESS_KD_PATH" close >/dev/null 2>&1 || true
+      fi
+      ;;
+    terminal)
+      printf '\n' >&2
+      ;;
+  esac
+  PVF_PROGRESS_KIND=""
+}
+
+percent_from_us() {
+  local us="$1"
+  local duration="$2"
+  awk -v us="$us" -v duration="$duration" 'BEGIN {
+    if (duration <= 0) { print 0; exit }
+    p = us / (duration * 1000000) * 100
+    if (p < 0) p = 0
+    if (p > 99) p = 99
+    printf "%d", p
+  }'
+}
+
+total_percent() {
+  local index="$1"
+  local total="$2"
+  local file_pct="$3"
+  awk -v idx="$index" -v total="$total" -v file_pct="$file_pct" 'BEGIN {
+    if (total <= 0) { print 0; exit }
+    p = (((idx - 1) + file_pct / 100.0) / total) * 100
+    if (p < 0) p = 0
+    if (p > 99) p = 99
+    printf "%d", p
+  }'
+}
+
+run_ffmpeg_with_progress() {
+  local log_file="$1"
+  local rel="$2"
+  local preset="$3"
+  local duration="$4"
+  local index="$5"
+  local total="$6"
+  shift 6
+
+  local line key value file_pct batch_pct status msg
+  file_pct=0
+  batch_pct="$(total_percent "$index" "$total" 0)"
+  msg="[$index/$total] $rel | $(transcode_mode_short_label "$preset") | 当前 0% | 总进度 ${batch_pct}%"
+  progress_update "$batch_pct" "$msg"
+
+  "$@" 2>>"$log_file" | while IFS= read -r line; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      out_time_ms|out_time_us)
+        file_pct="$(percent_from_us "$value" "$duration")"
+        batch_pct="$(total_percent "$index" "$total" "$file_pct")"
+        msg="[$index/$total] $rel | $(transcode_mode_short_label "$preset") | 当前 ${file_pct}% | 总进度 ${batch_pct}%"
+        progress_update "$batch_pct" "$msg"
+        ;;
+      progress)
+        if [[ "$value" == "end" ]]; then
+          file_pct=100
+          batch_pct="$(total_percent "$index" "$total" 100)"
+          if [[ "$index" -lt "$total" ]]; then
+            msg="[$index/$total] $rel | $(transcode_mode_short_label "$preset") | 当前 100% | 总进度 ${batch_pct}%"
+            progress_update "$batch_pct" "$msg"
+          fi
+        fi
+        ;;
+    esac
+  done
+  status=${PIPESTATUS[0]}
+  return "$status"
 }
 
 normalize_dir() {
@@ -503,7 +695,7 @@ scan_folder() {
       high)
         high_count=$((high_count + 1))
         printf '%-6s | %-9s | %-14s | %-14s | %-9s | %s\n' "处理" "$preset" "$vcodec" "${acodec:-none}" "${format:0:9}" "$rel" >> "$report_file"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(b64 "$file")" "$(b64 "$rel")" "$preset" "$format" "$vcodec" "$acodec" >> "$queue_file"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(b64 "$file")" "$(b64 "$rel")" "$preset" "$format" "$vcodec" "$acodec" "$duration" >> "$queue_file"
         ;;
       medium)
         medium_count=$((medium_count + 1))
@@ -561,13 +753,19 @@ convert_one() {
   local format="$5"
   local vcodec="$6"
   local acodec="$7"
+  local duration="$8"
+  local log_file="$9"
+  local index="${10}"
+  local total="${11}"
   local backup_dir="$root/$BACKUP_DIR_NAME"
   local backup_file="$backup_dir/files/$rel"
   local manifest="$backup_dir/$MANIFEST_NAME"
   local tmp sha converted_at backup_rel
+  local cmd=()
 
   if [[ -f "$backup_file" ]]; then
-    printf '跳过：已经有备份，避免重复转码：%s\n' "$rel"
+    printf '跳过：已经有备份，避免重复转码：%s\n' "$rel" >> "$log_file"
+    progress_update "$(total_percent "$index" "$total" 100)" "[$index/$total] $rel | 已有备份，跳过"
     return 0
   fi
 
@@ -578,66 +776,85 @@ convert_one() {
   case "$preset" in
     mpeg_mci)
       tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.mpg")"
-      "$FFMPEG" -hide_banner -nostdin -y -i "$file" \
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
         -map 0:v:0 -map 0:a? -sn -dn \
         -c:v mpeg1video -q:v 2 -pix_fmt yuv420p \
         -c:a mp2 -b:a 192k \
-        -f mpeg "$tmp"
+        -f mpeg "$tmp")
       ;;
     mpeg2_mpg)
       tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.mpg")"
-      "$FFMPEG" -hide_banner -nostdin -y -i "$file"         -map 0:v:0 -map 0:a? -sn -dn         -c:v mpeg2video -q:v 3 -pix_fmt yuv420p         -c:a mp2 -b:a 192k         -f mpeg "$tmp"
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
+        -map 0:v:0 -map 0:a? -sn -dn \
+        -c:v mpeg2video -q:v 3 -pix_fmt yuv420p \
+        -c:a mp2 -b:a 192k \
+        -f mpeg "$tmp")
       ;;
     h264_balanced)
       tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.mp4")"
-      "$FFMPEG" -hide_banner -nostdin -y -i "$file" \
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
         -map 0:v:0 -map 0:a? -sn -dn \
         -c:v libx264 -pix_fmt yuv420p -preset fast -crf 22 -movflags +faststart \
         -c:a aac -b:a 160k \
-        "$tmp"
+        "$tmp")
+      ;;
+    h264_fast)
+      tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.mp4")"
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
+        -map 0:v:0 -map 0:a? -sn -dn \
+        -c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 20 -movflags +faststart \
+        -c:a aac -b:a 160k \
+        "$tmp")
       ;;
     h264_small)
       tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.mp4")"
-      "$FFMPEG" -hide_banner -nostdin -y -i "$file" \
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
         -map 0:v:0 -map 0:a? -sn -dn \
         -c:v libx264 -pix_fmt yuv420p -preset fast -crf 27 -movflags +faststart \
         -c:a aac -b:a 128k \
-        "$tmp"
+        "$tmp")
       ;;
     h264_baseline)
       tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.mp4")"
-      "$FFMPEG" -hide_banner -nostdin -y -i "$file" \
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
         -map 0:v:0 -map 0:a? -sn -dn \
         -c:v libx264 -pix_fmt yuv420p -profile:v baseline -level 3.1 -preset medium -crf 20 -movflags +faststart \
         -c:a aac -b:a 160k \
-        "$tmp"
+        "$tmp")
       ;;
     webm_vp9)
       tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.webm")"
-      "$FFMPEG" -hide_banner -nostdin -y -i "$file" \
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
         -map 0:v:0 -map 0:a? -sn -dn \
         -c:v libvpx-vp9 -crf 32 -b:v 0 -row-mt 1 \
         -c:a libopus -b:a 160k \
-        "$tmp"
+        "$tmp")
       ;;
     h264_quality|modern|*)
       tmp="$(mktemp --tmpdir="$(dirname "$file")" ".pvf.XXXXXX.mp4")"
-      "$FFMPEG" -hide_banner -nostdin -y -i "$file" \
+      cmd=("$FFMPEG" -hide_banner -nostdin -nostats -progress pipe:1 -y -i "$file" \
         -map 0:v:0 -map 0:a? -sn -dn \
         -c:v libx264 -pix_fmt yuv420p -preset medium -crf 18 -movflags +faststart \
         -c:a aac -b:a 192k \
-        "$tmp"
+        "$tmp")
       ;;
   esac
 
+  printf '开始：%s [%s]\n' "$rel" "$preset" >> "$log_file"
+  if ! run_ffmpeg_with_progress "$log_file" "$rel" "$preset" "${duration:-0}" "$index" "$total" "${cmd[@]}"; then
+    rm -f -- "$tmp"
+    printf '失败：ffmpeg 转码失败：%s\n' "$rel" >> "$log_file"
+    return 1
+  fi
+
   if [[ ! -s "$tmp" ]]; then
     rm -f -- "$tmp"
-    printf '失败：输出为空：%s\n' "$rel" >&2
+    printf '失败：输出为空：%s\n' "$rel" >> "$log_file"
     return 1
   fi
   if ! "$FFPROBE" -v error "$tmp" >/dev/null 2>&1; then
     rm -f -- "$tmp"
-    printf '失败：ffprobe 无法读取输出：%s\n' "$rel" >&2
+    printf '失败：ffprobe 无法读取输出：%s\n' "$rel" >> "$log_file"
     return 1
   fi
 
@@ -651,7 +868,7 @@ convert_one() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(b64 "$rel")" "$(b64 "$backup_rel")" "$sha" "$format" "$vcodec" "$acodec" "$preset" "$converted_at" >> "$manifest"
 
-  printf '完成：%s [%s]\n' "$rel" "$preset"
+  printf '完成：%s [%s]\n' "$rel" "$preset" >> "$log_file"
 }
 
 run_convert() {
@@ -708,10 +925,12 @@ run_convert() {
     echo "ffprobe: $FFPROBE"
     echo "transcode_mode: $transcode_mode"
     echo "transcode_mode_label: $transcode_label"
+    echo "progress_mode: $PVF_PROGRESS"
     echo ""
   } >> "$log_file"
 
-  while IFS=$'\t' read -r file_b64 rel_b64 preset format vcodec acodec; do
+  progress_begin "$total"
+  while IFS=$'\t' read -r file_b64 rel_b64 preset format vcodec acodec duration; do
     local file rel
     file="$(b64d "$file_b64")"
     rel="$(b64d "$rel_b64")"
@@ -720,13 +939,14 @@ run_convert() {
       recommended|*) true ;;
     esac
     done_count=$((done_count + 1))
-    printf '[%s/%s] %s [%s]\n' "$done_count" "$total" "$rel" "$preset" | tee -a "$log_file"
-    if convert_one "$root" "$file" "$rel" "$preset" "$format" "$vcodec" "$acodec" >> "$log_file" 2>&1; then
+    printf '[%s/%s] %s [%s]\n' "$done_count" "$total" "$rel" "$preset" >> "$log_file"
+    if convert_one "$root" "$file" "$rel" "$preset" "$format" "$vcodec" "$acodec" "${duration:-0}" "$log_file" "$done_count" "$total"; then
       true
     else
       errors=$((errors + 1))
     fi
   done < "$queue"
+  progress_finish
 
   {
     echo ""
